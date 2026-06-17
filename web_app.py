@@ -378,7 +378,8 @@ def add_task():
     category = data.get('category', '').strip()
     regex_pattern = data.get('regex_pattern', '').strip()
     regex_replace = data.get('regex_replace', '').strip()
-    
+    size_check = data.get('size_check', False)
+
     if not url or not save_dir:
         return jsonify({'success': False, 'message': '分享链接和保存目录不能为空'})
     
@@ -408,7 +409,7 @@ def add_task():
         
     try:
         # 添加任务 - storage.py 内部会处理调度器更新
-        if storage.add_task(url, save_dir, pwd, name, cron, category, regex_pattern, regex_replace):
+        if storage.add_task(url, save_dir, pwd, name, cron, category, regex_pattern, regex_replace, size_check):
             
             return jsonify({'success': True, 'message': '添加任务成功'})
             
@@ -468,6 +469,7 @@ def update_task():
         'category': data.get('category', '').strip(),
         'regex_pattern': data.get('regex_pattern', '').strip(),
         'regex_replace': data.get('regex_replace', '').strip(),
+        'size_check': data.get('size_check', False),
         'order': task_order,  # 保持原有的order
         'status': task.get('status', 'normal'),  # 保持原有的状态
         'message': task.get('message', ''),  # 保持原有的消息

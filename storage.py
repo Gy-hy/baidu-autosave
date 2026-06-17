@@ -670,7 +670,7 @@ class BaiduStorage:
             logger.error(f"调整任务顺序失败: {str(e)}")
             return False
 
-    def add_task(self, url, save_dir, pwd=None, name=None, cron=None, category=None, regex_pattern=None, regex_replace=None):
+    def add_task(self, url, save_dir, pwd=None, name=None, cron=None, category=None, regex_pattern=None, regex_replace=None, size_check=False):
         """添加任务"""
         try:
             if not url or not save_dir:
@@ -720,6 +720,8 @@ class BaiduStorage:
             if regex_pattern:
                 new_task['regex_pattern'] = regex_pattern.strip()
                 new_task['regex_replace'] = regex_replace.strip() if regex_replace else ''
+            if size_check:
+                new_task['size_check'] = True
             
             # 添加任务
             tasks = self.config['baidu'].get('tasks', [])
@@ -844,6 +846,19 @@ class BaiduStorage:
         if isinstance(item, dict):
             return str(item.get('path', '') or '')
         return str(getattr(item, 'path', '') or '')
+
+    def _get_list_entry_size(self, item):
+        """提取目录枚举结果中的文件大小（字节），缺失时返回 -1。"""
+        try:
+            if isinstance(item, dict):
+                size = item.get('size')
+            else:
+                size = getattr(item, 'size', None)
+            if size is not None:
+                return int(size)
+        except (TypeError, ValueError):
+            pass
+        return -1
 
     def _is_list_entry_dir(self, item):
         """判断目录枚举结果是否为目录。"""
@@ -1294,8 +1309,8 @@ class BaiduStorage:
                 if progress_callback:
                     progress_callback('info', f'【步骤2/4】扫描本地目录: {save_dir}')
                 
-                # 获取本地文件列表
-                local_files = []
+                # 获取本地文件列表（{filename: size}）
+                local_files = {}
                 if save_dir:
                     local_files = self.list_local_files(save_dir, client=temp_client)
                     if progress_callback:
@@ -1317,6 +1332,7 @@ class BaiduStorage:
                 logger.info("开始对比共享文件和本地文件...")
                 transfer_list = []  # 存储(fs_id, dir_path, clean_path, final_path, need_rename)元组
                 rename_only_list = []  # 存储仅需重命名的文件(None, dir_path, clean_path, final_path, True)
+                files_to_delete = set()  # 收集需要覆盖的旧文件完整路径（大小不一致时先删后转）
                 
                 # 使用之前收集的共享文件信息进行对比
                 for file_info in shared_files_info:
@@ -1336,37 +1352,80 @@ class BaiduStorage:
                                 progress_callback('info', f'文件被正则过滤掉: {clean_path}')
                             continue
                     
-                    # 🔄 改进的去重检查逻辑
-                    clean_normalized = self._normalize_path(clean_path, file_only=True)
-                    final_normalized = self._normalize_path(final_path, file_only=True)
-                    
-                    # 检查原文件是否存在
+                    # 🔄 改进的去重检查逻辑（相对路径 + 大小双重对比）
+                    # 用相对于 save_dir 的完整路径做精确匹配，避免不同子目录同名文件冲突
+                    clean_normalized = clean_path.replace('\\', '/').strip('/')
+                    final_normalized = final_path.replace('\\', '/').strip('/')
+
+                    # 获取共享文件的大小
+                    shared_file_size = file_info.get('size', 0)
+
+                    # 检查同名文件是否存在，以及大小是否一致
                     original_exists = clean_normalized in local_files
-                    # 检查重命名后文件是否存在  
                     final_exists = final_normalized in local_files
-                    
+
+                    # 判断现有文件大小是否与共享文件一致（不一致说明内容有更新，需重新转存）
+                    # 仅当任务配置中 size_check=True 时才启用大小对比
+                    _size_check_enabled = bool(task_config.get('size_check', False)) if task_config else False
+
+                    def _size_matches(filename):
+                        """检查本地文件大小是否与共享文件一致。未启用 size_check 或任一方大小未知时保守返回 True。"""
+                        if not _size_check_enabled:
+                            return True  # 未启用大小检查，跳过对比
+                        local_size = local_files.get(filename, -1)
+                        if local_size <= 0 or shared_file_size <= 0:
+                            logger.debug(f"大小对比跳过（本地:{local_size}, 分享:{shared_file_size}）: {filename}")
+                            return True  # 任一方大小未知或为零，保守认为匹配
+                        match = local_size == shared_file_size
+                        if not match:
+                            logger.info(f"文件大小不一致（本地:{local_size} vs 分享:{shared_file_size}），将重新转存: {filename}")
+                        return match
+
                     if final_path != clean_path:  # 需要重命名
                         if original_exists and not final_exists:
-                            # 原文件存在但重命名后的不存在 = 仅需重命名，不需转存
-                            logger.info(f"文件已存在但未重命名，将执行重命名: {clean_path} -> {final_path}")
-                            if progress_callback:
-                                progress_callback('info', f'文件需重命名: {clean_path} -> {final_path}')
-                            # 添加到重命名列表（不转存）
-                            rename_only_list.append((None, target_dir, clean_path, final_path, True))
-                            continue
+                            if _size_matches(clean_normalized):
+                                # 原文件存在，大小一致 → 仅需重命名，不需转存
+                                logger.info(f"文件已存在（大小一致），仅需重命名: {clean_path} -> {final_path}")
+                                if progress_callback:
+                                    progress_callback('info', f'文件需重命名: {clean_path} -> {final_path}')
+                                rename_only_list.append((None, target_dir, clean_path, final_path, True))
+                                continue
+                            else:
+                                # 原文件存在但大小不一致 → 需要重新转存+重命名
+                                logger.info(f"文件大小不一致（本地:{local_files.get(clean_normalized)} vs 分享:{shared_file_size}），将重新转存: {clean_path} -> {final_path}")
+                                if progress_callback:
+                                    progress_callback('info', f'文件内容已变更，将重新转存: {clean_path} -> {final_path}')
+                                # 记录旧文件待删除
+                                files_to_delete.add(posixpath.join(target_dir, clean_path))
+                                # 继续往下走，加入 transfer_list
                         elif final_exists:
-                            # 重命名后的文件已存在
-                            logger.debug(f"重命名后文件已存在，跳过: {final_path}")
-                            if progress_callback:
-                                progress_callback('info', f'文件已存在，跳过: {final_path}')
-                            continue
+                            if _size_matches(final_normalized):
+                                logger.debug(f"重命名后文件已存在（大小一致），跳过: {final_path}")
+                                if progress_callback:
+                                    progress_callback('info', f'文件已存在，跳过: {final_path}')
+                                continue
+                            else:
+                                logger.info(f"重命名后文件大小不一致（本地:{local_files.get(final_normalized)} vs 分享:{shared_file_size}），将重新转存: {clean_path} -> {final_path}")
+                                if progress_callback:
+                                    progress_callback('info', f'文件内容已变更，将重新转存: {final_path}')
+                                # 记录旧文件待删除
+                                files_to_delete.add(posixpath.join(target_dir, final_path))
+                                # 继续往下走，加入 transfer_list
                         # else: 原文件和重命名后文件都不存在，需要转存+重命名
                     else:  # 不需要重命名
                         if final_exists:
-                            logger.debug(f"文件已存在，跳过: {final_path}")
-                            if progress_callback:
-                                progress_callback('info', f'文件已存在，跳过: {final_path}')
-                            continue
+                            if _size_matches(final_normalized):
+                                logger.debug(f"文件已存在（大小一致），跳过: {final_path}")
+                                if progress_callback:
+                                    progress_callback('info', f'文件已存在，跳过: {final_path}')
+                                continue
+                            else:
+                                logger.info(f"文件大小不一致（本地:{local_files.get(final_normalized)} vs 分享:{shared_file_size}），将重新转存: {final_path}")
+                                if progress_callback:
+                                    progress_callback('info', f'文件内容已变更，将重新转存: {final_path}')
+                                # 记录旧文件待删除
+                                files_to_delete.add(posixpath.join(target_dir, final_path))
+                                # 继续往下走，加入 transfer_list
                     
                     # 检查是否在指定的文件列表中（使用原始路径检查）
                     if new_files is None or clean_path in new_files:
@@ -1472,6 +1531,26 @@ class BaiduStorage:
                             return {'success': False, 'error': f'创建目录失败: {dir_path}'}
                         created_dirs.add(dir_path)
                 
+                # 步骤3.3：转存前先删除大小不一致的旧文件（避免百度 API 自动重命名产生 (1).csv）
+                if files_to_delete:
+                    logger.info(f"=== 转存前清理：删除 {len(files_to_delete)} 个旧文件以实现覆盖 ===")
+                    if progress_callback:
+                        progress_callback('info', f'转存前删除 {len(files_to_delete)} 个旧文件')
+                    for old_path in files_to_delete:
+                        try:
+                            temp_client.remove(old_path)
+                            logger.info(f"已删除旧文件: {old_path}")
+                            if progress_callback:
+                                progress_callback('info', f'已删除旧文件: {os.path.basename(old_path)}')
+                        except Exception as e:
+                            # 删除失败不阻断流程，最坏情况是百度自动重命名
+                            logger.warning(f"删除旧文件失败（将继续转存，可能产生副本）: {old_path}, 错误: {str(e)}")
+                            if progress_callback:
+                                progress_callback('warning', f'删除旧文件失败: {os.path.basename(old_path)}')
+                    # 删除后等待一下，避免 API 频率限制
+                    if len(files_to_delete) > 1:
+                        time.sleep(0.5)
+
                 # 步骤4：执行文件转存
                 logger.info(f"=== 【步骤4/4】开始执行转存操作 ===")
                 logger.info(f"共需转存 {len(transfer_list)} 个文件")
@@ -1934,10 +2013,12 @@ class BaiduStorage:
             return False
             
     def list_local_files(self, dir_path, client=None):
-        """获取本地目录中的所有文件列表
+        """获取本地目录中的所有文件及其大小
         Args:
             dir_path: 目录路径
             client: 客户端实例，默认为None则使用self.client
+        Returns:
+            dict: {relative_path: size} — 相对于 dir_path 的文件路径到大小的映射，目录不存在时返回空字典
         """
         try:
             if client is None:
@@ -1945,7 +2026,7 @@ class BaiduStorage:
 
             dir_path = self._normalize_path(dir_path)
             logger.debug(f"开始获取本地目录 {dir_path} 的文件列表")
-            files = []
+            files = {}  # {filename: size}
 
             def _list_dir_with_fallback(path, allow_missing=False):
                 """优先使用 PCS list，失败时回退到 pan API。"""
@@ -1967,10 +2048,10 @@ class BaiduStorage:
                 root_content = _list_dir_with_fallback(dir_path, allow_missing=True)
                 if root_content is None:
                     logger.info(f"本地目录 {dir_path} 不存在，将在转存时创建")
-                    return []
+                    return {}
             except Exception as e:
                 logger.error(f"检查目录 {dir_path} 时出错: {str(e)}")
-                return []
+                return {}
 
             def _list_dir(path, prefetched_content=None):
                 try:
@@ -1982,10 +2063,14 @@ class BaiduStorage:
                             continue
 
                         if self._is_list_entry_file(item):
-                            # 只保留文件名进行对比
-                            file_name = os.path.basename(item_path)
-                            files.append(file_name)
-                            logger.debug(f"记录本地文件: {file_name}")
+                            file_size = self._get_list_entry_size(item)
+                            # 使用相对于 save_dir 的路径作为 key，避免不同子目录同名文件冲突
+                            rel_path = item_path
+                            if item_path.startswith(dir_path):
+                                rel_path = item_path[len(dir_path):]
+                            rel_path = rel_path.replace('\\', '/').strip('/')
+                            files[rel_path] = file_size
+                            logger.debug(f"记录本地文件: {rel_path} ({file_size} 字节)")
                         elif self._is_list_entry_dir(item):
                             _list_dir(item_path)
 
@@ -1997,10 +2082,11 @@ class BaiduStorage:
 
             # 有序展示文件列表
             if files:
-                display_files = files[:20] if len(files) > 20 else files
-                logger.info(f"本地目录 {dir_path} 扫描完成，找到 {len(files)} 个文件: {display_files}")
-                if len(files) > 20:
-                    logger.debug(f"... 还有 {len(files) - 20} 个文件未在日志中显示 ...")
+                file_names = sorted(files.keys())
+                display = file_names[:20] if len(file_names) > 20 else file_names
+                logger.info(f"本地目录 {dir_path} 扫描完成，找到 {len(files)} 个文件: {display}")
+                if len(file_names) > 20:
+                    logger.debug(f"... 还有 {len(file_names) - 20} 个文件未在日志中显示 ...")
             else:
                 logger.info(f"本地目录 {dir_path} 扫描完成，未找到任何文件")
 
@@ -2008,7 +2094,7 @@ class BaiduStorage:
 
         except Exception as e:
             logger.error(f"获取本地文件列表失败: {str(e)}")
-            return []
+            return {}
             
     def _extract_file_info(self, file_dict):
         """从文件字典中提取文件信息
@@ -2471,6 +2557,13 @@ class BaiduStorage:
                     # 如果过滤表达式为空，删除相关字段
                     tasks[task_index].pop('regex_pattern', None)
                     tasks[task_index].pop('regex_replace', None)
+
+            # 处理文件大小检查字段
+            if 'size_check' in task_data:
+                if task_data['size_check']:
+                    tasks[task_index]['size_check'] = True
+                else:
+                    tasks[task_index].pop('size_check', None)
             
             # 保存配置并更新调度器
             self._save_config()

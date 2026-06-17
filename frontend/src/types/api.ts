@@ -22,6 +22,7 @@ export interface Task {
   cron?: string
   regex_pattern?: string
   regex_replace?: string
+  size_check?: boolean
   share_info?: ShareInfo
   created_at?: string
   updated_at?: string
@@ -44,6 +45,7 @@ export interface CreateTaskRequest {
   cron?: string
   regex_pattern?: string
   regex_replace?: string
+  size_check?: boolean
 }
 
 export interface UpdateTaskRequest {
@@ -55,6 +57,7 @@ export interface UpdateTaskRequest {
   cron?: string
   regex_pattern?: string
   regex_replace?: string
+  size_check?: boolean
 }
 
 export interface TaskOperation {

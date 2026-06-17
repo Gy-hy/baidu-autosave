@@ -265,12 +265,13 @@
               </div>
               
               <!-- 高级功能标签 -->
-              <div class="content-row" v-if="task.cron || task.regex_pattern || task.regex_replace">
+              <div class="content-row" v-if="task.cron || task.regex_pattern || task.regex_replace || task.size_check">
                 <span class="label">高级功能:</span>
                 <div class="advanced-tags">
                   <el-tag v-if="task.cron" size="small" type="warning">定时</el-tag>
                   <el-tag v-if="task.regex_pattern" size="small" type="info">过滤</el-tag>
                   <el-tag v-if="task.regex_replace" size="small" type="success">重命名</el-tag>
+                  <el-tag v-if="task.size_check" size="small" type="danger">智能去重</el-tag>
                 </div>
               </div>
               

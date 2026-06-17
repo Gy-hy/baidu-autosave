@@ -2,13 +2,15 @@ version: '3'
 
 services:
   baidu-autosave:
-    image: kokojacket/baidu-autosave:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: baidu-autosave
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5001:5000"
     volumes:
       - ./config:/app/config
       - ./log:/app/log
     environment:
-      - TZ=Asia/Shanghai 
+      - TZ=Asia/Shanghai

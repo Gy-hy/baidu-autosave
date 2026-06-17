@@ -103,6 +103,15 @@
             />
             <div class="form-help">正则表达式替换，用于重命名文件，留空表示不重命名</div>
           </el-form-item>
+
+          <el-form-item label="智能去重">
+            <el-switch
+              v-model="form.size_check"
+              active-text="启用大小对比"
+              inactive-text="仅文件名"
+            />
+            <div class="form-help">开启后，同名文件大小不一致时将重新转存（覆盖旧文件）；关闭则仅按文件名去重</div>
+          </el-form-item>
     </el-form>
     
     <template #footer>
@@ -169,7 +178,8 @@ const form = reactive({
   category: '',
   cron: '',
   regex_pattern: '',
-  regex_replace: ''
+  regex_replace: '',
+  size_check: false
 })
 
 // 高级设置折叠面板状态
@@ -206,6 +216,7 @@ const resetForm = () => {
   form.cron = ''
   form.regex_pattern = ''
   form.regex_replace = ''
+  form.size_check = false
   pathNameSync.value = true // 重置开关状态
   formRef.value?.resetFields()
 }
@@ -339,7 +350,8 @@ const loadTaskData = (task: Task) => {
   form.cron = task.cron || ''
   form.regex_pattern = task.regex_pattern || ''
   form.regex_replace = task.regex_replace || ''
-  
+  form.size_check = task.size_check || false
+
   // 编辑任务时禁用同步开关，避免意外修改路径
   pathNameSync.value = false
   
