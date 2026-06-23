@@ -23,6 +23,7 @@ export interface Task {
   regex_pattern?: string
   regex_replace?: string
   size_check?: boolean
+  download_dir?: string
   share_info?: ShareInfo
   created_at?: string
   updated_at?: string
@@ -46,6 +47,7 @@ export interface CreateTaskRequest {
   regex_pattern?: string
   regex_replace?: string
   size_check?: boolean
+  download_dir?: string
 }
 
 export interface UpdateTaskRequest {
@@ -58,6 +60,7 @@ export interface UpdateTaskRequest {
   regex_pattern?: string
   regex_replace?: string
   size_check?: boolean
+  download_dir?: string
 }
 
 export interface TaskOperation {

@@ -379,6 +379,7 @@ def add_task():
     regex_pattern = data.get('regex_pattern', '').strip()
     regex_replace = data.get('regex_replace', '').strip()
     size_check = data.get('size_check', False)
+    download_dir = data.get('download_dir', '').strip()
 
     if not url or not save_dir:
         return jsonify({'success': False, 'message': '分享链接和保存目录不能为空'})
@@ -409,7 +410,7 @@ def add_task():
         
     try:
         # 添加任务 - storage.py 内部会处理调度器更新
-        if storage.add_task(url, save_dir, pwd, name, cron, category, regex_pattern, regex_replace, size_check):
+        if storage.add_task(url, save_dir, pwd, name, cron, category, regex_pattern, regex_replace, size_check, download_dir):
             
             return jsonify({'success': True, 'message': '添加任务成功'})
             
@@ -470,6 +471,7 @@ def update_task():
         'regex_pattern': data.get('regex_pattern', '').strip(),
         'regex_replace': data.get('regex_replace', '').strip(),
         'size_check': data.get('size_check', False),
+        'download_dir': data.get('download_dir', '').strip(),
         'order': task_order,  # 保持原有的order
         'status': task.get('status', 'normal'),  # 保持原有的状态
         'message': task.get('message', ''),  # 保持原有的消息
@@ -1940,6 +1942,52 @@ def cleanup_old_task_logs():
                 
     except Exception as e:
         logger.error(f"清理任务日志失败: {str(e)}")
+
+@app.route('/api/transfer/history', methods=['GET'])
+@handle_api_error
+def get_transfer_history():
+    """获取转存历史记录"""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        task_url = request.args.get('task_url', None)
+        records = storage.get_transfer_history(limit=limit, task_url=task_url)
+        return jsonify({'success': True, 'records': records})
+    except Exception as e:
+        logger.error(f"获取转存历史失败: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/transfer/redownload', methods=['POST'])
+@login_required
+@handle_api_error
+def redownload_failed_files():
+    """重新下载上次失败的文件"""
+    data = request.get_json() or {}
+    task_url = data.get('task_url', '').strip()
+    if not task_url:
+        return jsonify({'success': False, 'message': '缺少 task_url 参数'})
+
+    # 查找对应任务配置
+    task_config = None
+    for t in storage.list_tasks():
+        if t.get('url') == task_url:
+            task_config = t
+            break
+    if not task_config:
+        return jsonify({'success': False, 'message': '未找到对应任务'})
+
+    if not task_config.get('download_dir'):
+        return jsonify({'success': False, 'message': '该任务未配置下载目录'})
+
+    try:
+        result = storage.redownload_failed_files(task_config)
+        return jsonify({
+            'success': True,
+            'download_result': result,
+            'message': f'重新下载完成: 成功 {result["success"]}, 跳过 {result["skipped"]}, 失败 {result["failed"]}'
+        })
+    except Exception as e:
+        logger.error(f"重新下载失败: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/task/log/<int:task_id>', methods=['GET'])
 @login_required

@@ -112,6 +112,15 @@
             />
             <div class="form-help">开启后，同名文件大小不一致时将重新转存（覆盖旧文件）；关闭则仅按文件名去重</div>
           </el-form-item>
+
+          <el-form-item label="本地下载目录" prop="download_dir">
+            <el-input
+              v-model="form.download_dir"
+              placeholder="如：/app/downloads （留空则不下载到本地）"
+              clearable
+            />
+            <div class="form-help">填写容器内路径，配合 Docker 卷映射可将文件下载到宿主机。需在 docker-compose.yml 中添加卷映射</div>
+          </el-form-item>
     </el-form>
     
     <template #footer>
@@ -179,7 +188,8 @@ const form = reactive({
   cron: '',
   regex_pattern: '',
   regex_replace: '',
-  size_check: false
+  size_check: false,
+  download_dir: '/app/downloads'
 })
 
 // 高级设置折叠面板状态
@@ -217,6 +227,7 @@ const resetForm = () => {
   form.regex_pattern = ''
   form.regex_replace = ''
   form.size_check = false
+  form.download_dir = '/app/downloads'
   pathNameSync.value = true // 重置开关状态
   formRef.value?.resetFields()
 }
@@ -351,6 +362,7 @@ const loadTaskData = (task: Task) => {
   form.regex_pattern = task.regex_pattern || ''
   form.regex_replace = task.regex_replace || ''
   form.size_check = task.size_check || false
+  form.download_dir = task.download_dir || ''
 
   // 编辑任务时禁用同步开关，避免意外修改路径
   pathNameSync.value = false

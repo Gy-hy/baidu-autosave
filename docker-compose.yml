@@ -12,5 +12,6 @@ services:
     volumes:
       - ./config:/app/config
       - ./log:/app/log
+      - ./downloads:/app/downloads
     environment:
       - TZ=Asia/Shanghai

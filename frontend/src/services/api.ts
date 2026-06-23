@@ -51,6 +51,16 @@ export class ApiService {
     return httpClient.post('/api/task/move', { task_id: taskId, new_index: newIndex })
   }
 
+  async getTransferHistory(limit = 50, taskUrl?: string): Promise<ApiResponse<{ records: any[] }>> {
+    const params: any = { limit }
+    if (taskUrl) params.task_url = taskUrl
+    return httpClient.get('/api/transfer/history', { params })
+  }
+
+  async redownloadFailedFiles(taskUrl: string): Promise<ApiResponse<{ download_result: any, message: string }>> {
+    return httpClient.post('/api/transfer/redownload', { task_url: taskUrl })
+  }
+
   // 用户相关API
   async getUsers(): Promise<ApiResponse<{ users: User[], current_user: string }>> {
     return httpClient.get('/api/users')

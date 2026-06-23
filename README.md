@@ -251,6 +251,79 @@ baidu-autosave/
 3. 设置检查时间（默认每天00:00）
 4. 当网盘使用量超过设定阈值时，系统将通过已配置的通知渠道发送警告
 
+## API 接口
+
+项目提供 RESTful API 供外部工具调用，所有接口返回 JSON。
+
+### 获取转存历史
+
+免登录，直接 GET 请求即可。
+
+```
+GET /api/transfer/history
+```
+
+**参数：**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|:---:|--------|------|
+| `limit` | int | 否 | 50 | 最多返回条数 |
+| `task_url` | string | 否 | — | 按分享链接过滤，只查指定任务 |
+
+**调用示例：**
+
+```bash
+# 查询最近 50 条记录
+curl "http://localhost:5000/api/transfer/history"
+
+# 指定返回条数
+curl "http://localhost:5000/api/transfer/history?limit=100"
+
+# 按任务过滤
+curl "http://localhost:5000/api/transfer/history?task_url=https://pan.baidu.com/s/xxxxx"
+```
+
+**响应示例：**
+
+```json
+{
+  "success": true,
+  "records": [
+    {
+      "task_name": "指数与ETF网盘转存",
+      "task_url": "https://pan.baidu.com/s/xxxxx",
+      "save_dir": "ETF数据/指数与ETF数据",
+      "time": "2026-06-21 00:01:30",
+      "success": true,
+      "message": "成功转存 21/21 个文件",
+      "new_count": 1,
+      "updated_count": 2,
+      "skipped_count": 18,
+      "files": [
+        { "path": "ETF/new.csv", "action": "new" },
+        { "path": "ETF/2022.zip", "action": "updated", "old_size": 17852939, "new_size": 72989688 },
+        { "path": "ETF/old.parquet", "action": "skipped" }
+      ]
+    }
+  ]
+}
+```
+
+**响应字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `task_name` | 任务名称 |
+| `task_url` | 百度网盘分享链接 |
+| `time` | 执行时间 |
+| `success` | 是否成功 |
+| `new_count` | 本次新增的文件数 |
+| `updated_count` | 覆盖更新的文件数（启用智能去重时） |
+| `skipped_count` | 跳过的文件数（本地已有且无变化） |
+| `files[].action` | `new` 新增 / `updated` 更新 / `skipped` 跳过 |
+| `files[].old_size` | 旧文件大小（字节，仅 updated） |
+| `files[].new_size` | 新文件大小（字节，仅 updated） |
+
 ## 配置文件说明
 
 `config.json` 包含以下主要配置（示例）：

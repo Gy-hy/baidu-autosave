@@ -493,38 +493,100 @@ class BaiduStorage:
             logger.error(f"获取用户信息失败: {str(e)}")
             return None
             
-    def _save_record(self, share_url, status):
-        """保存转存记录
+    def _save_transfer_history(self, task_config, result, transferred_files=None, skipped_files=None,
+                                updated_files=None, local_files_sizes=None):
+        """保存转存历史记录（持久化到 config/transfer_history.json）
         Args:
-            share_url: 分享链接
-            status: 转存状态,True表示成功,False表示失败
+            task_config: 任务配置字典
+            result: transfer_share 的返回结果 {'success': bool, 'message': str, ...}
+            transferred_files: 成功转存的文件列表
+            skipped_files: 跳过的文件列表
+            updated_files: 因大小不一致被覆盖的文件列表 [{'path': ..., 'old_size': ..., 'new_size': ...}]
+            local_files_sizes: 本地文件大小字典 {path: size}
         """
         try:
+            history_dir = 'config'
+            os.makedirs(history_dir, exist_ok=True)
+            history_file = os.path.join(history_dir, 'transfer_history.json')
+
+            files_detail = []
+            if transferred_files:
+                for f in transferred_files:
+                    entry = {'path': f, 'action': 'new'}
+                    # 检查是否属于覆盖更新
+                    for uf in (updated_files or []):
+                        if uf.get('path') == f or uf.get('final_path') == f:
+                            entry['action'] = 'updated'
+                            entry['old_size'] = uf.get('old_size', 0)
+                            entry['new_size'] = uf.get('new_size', 0)
+                            break
+                    files_detail.append(entry)
+            if skipped_files:
+                for f in skipped_files:
+                    files_detail.append({'path': f, 'action': 'skipped'})
+
             record = {
-                "url": share_url,
-                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "成功" if status else "失败"
+                'task_name': task_config.get('name', task_config.get('url', '')),
+                'task_url': task_config.get('url', ''),
+                'save_dir': task_config.get('save_dir', ''),
+                'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'timestamp': int(time.time()),
+                'success': result.get('success', False),
+                'skipped': result.get('skipped', False),
+                'message': result.get('message') or result.get('error', ''),
+                'new_count': len([f for f in files_detail if f['action'] == 'new']),
+                'updated_count': len([f for f in files_detail if f['action'] == 'updated']),
+                'skipped_count': len([f for f in files_detail if f['action'] == 'skipped']),
+                'files': files_detail,
+                'download_result': result.get('download_result')
             }
-            
+
             records = []
             try:
-                with open('file_records.json', 'r', encoding='utf-8') as f:
+                with open(history_file, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
-                    if content:  # 只有当文件不为空时才解析
+                    if content:
                         records = json.loads(content)
                     if not isinstance(records, list):
                         records = []
-            except FileNotFoundError:
-                # 文件不存在时创建空列表
+            except (FileNotFoundError, json.JSONDecodeError):
                 records = []
-                
-            records.append(record)
-            
-            with open('file_records.json', 'w', encoding='utf-8') as f:
-                json.dump(records, f, ensure_ascii=False, indent=4)
-                
+
+            records.insert(0, record)  # 最新记录在最前面
+
+            # 最多保留 500 条
+            if len(records) > 500:
+                records = records[:500]
+
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"转存历史已保存: {record['task_name']} - {record['message']}")
         except Exception as e:
-            logger.error(f"保存转存记录失败: {str(e)}")
+            logger.error(f"保存转存历史失败: {str(e)}")
+
+    def get_transfer_history(self, limit=50, task_url=None):
+        """获取转存历史记录
+        Args:
+            limit: 最大返回条数
+            task_url: 可选，按任务URL过滤
+        Returns:
+            list: 历史记录列表
+        """
+        try:
+            history_file = os.path.join('config', 'transfer_history.json')
+            with open(history_file, 'r', encoding='utf-8') as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                return []
+            if task_url:
+                records = [r for r in records if r.get('task_url') == task_url]
+            return records[:limit]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        except Exception as e:
+            logger.error(f"读取转存历史失败: {str(e)}")
+            return []
             
     def get_max_order(self):
         """获取当前最大的任务顺序值"""
@@ -670,7 +732,7 @@ class BaiduStorage:
             logger.error(f"调整任务顺序失败: {str(e)}")
             return False
 
-    def add_task(self, url, save_dir, pwd=None, name=None, cron=None, category=None, regex_pattern=None, regex_replace=None, size_check=False):
+    def add_task(self, url, save_dir, pwd=None, name=None, cron=None, category=None, regex_pattern=None, regex_replace=None, size_check=False, download_dir=None):
         """添加任务"""
         try:
             if not url or not save_dir:
@@ -722,7 +784,9 @@ class BaiduStorage:
                 new_task['regex_replace'] = regex_replace.strip() if regex_replace else ''
             if size_check:
                 new_task['size_check'] = True
-            
+            if download_dir and download_dir.strip():
+                new_task['download_dir'] = download_dir.strip()
+
             # 添加任务
             tasks = self.config['baidu'].get('tasks', [])
             tasks.append(new_task)
@@ -1333,7 +1397,9 @@ class BaiduStorage:
                 transfer_list = []  # 存储(fs_id, dir_path, clean_path, final_path, need_rename)元组
                 rename_only_list = []  # 存储仅需重命名的文件(None, dir_path, clean_path, final_path, True)
                 files_to_delete = set()  # 收集需要覆盖的旧文件完整路径（大小不一致时先删后转）
-                
+                skipped_files = []  # 记录跳过的文件路径（用于历史记录）
+                updated_files = []  # 记录覆盖更新的文件 [{path, old_size, new_size}, ...]
+
                 # 使用之前收集的共享文件信息进行对比
                 for file_info in shared_files_info:
                     clean_path = file_info['path']
@@ -1389,6 +1455,7 @@ class BaiduStorage:
                                 if progress_callback:
                                     progress_callback('info', f'文件需重命名: {clean_path} -> {final_path}')
                                 rename_only_list.append((None, target_dir, clean_path, final_path, True))
+                                skipped_files.append(clean_path)
                                 continue
                             else:
                                 # 原文件存在但大小不一致 → 需要重新转存+重命名
@@ -1397,12 +1464,15 @@ class BaiduStorage:
                                     progress_callback('info', f'文件内容已变更，将重新转存: {clean_path} -> {final_path}')
                                 # 记录旧文件待删除
                                 files_to_delete.add(posixpath.join(target_dir, clean_path))
+                                updated_files.append({'path': clean_path, 'final_path': final_path,
+                                    'old_size': local_files.get(clean_normalized, -1), 'new_size': shared_file_size})
                                 # 继续往下走，加入 transfer_list
                         elif final_exists:
                             if _size_matches(final_normalized):
                                 logger.debug(f"重命名后文件已存在（大小一致），跳过: {final_path}")
                                 if progress_callback:
                                     progress_callback('info', f'文件已存在，跳过: {final_path}')
+                                skipped_files.append(final_path)
                                 continue
                             else:
                                 logger.info(f"重命名后文件大小不一致（本地:{local_files.get(final_normalized)} vs 分享:{shared_file_size}），将重新转存: {clean_path} -> {final_path}")
@@ -1410,6 +1480,7 @@ class BaiduStorage:
                                     progress_callback('info', f'文件内容已变更，将重新转存: {final_path}')
                                 # 记录旧文件待删除
                                 files_to_delete.add(posixpath.join(target_dir, final_path))
+                                updated_files.append({'path': final_path, 'old_size': local_files.get(final_normalized, -1), 'new_size': shared_file_size})
                                 # 继续往下走，加入 transfer_list
                         # else: 原文件和重命名后文件都不存在，需要转存+重命名
                     else:  # 不需要重命名
@@ -1418,6 +1489,7 @@ class BaiduStorage:
                                 logger.debug(f"文件已存在（大小一致），跳过: {final_path}")
                                 if progress_callback:
                                     progress_callback('info', f'文件已存在，跳过: {final_path}')
+                                skipped_files.append(final_path)
                                 continue
                             else:
                                 logger.info(f"文件大小不一致（本地:{local_files.get(final_normalized)} vs 分享:{shared_file_size}），将重新转存: {final_path}")
@@ -1425,6 +1497,7 @@ class BaiduStorage:
                                     progress_callback('info', f'文件内容已变更，将重新转存: {final_path}')
                                 # 记录旧文件待删除
                                 files_to_delete.add(posixpath.join(target_dir, final_path))
+                                updated_files.append({'path': final_path, 'old_size': local_files.get(final_normalized, -1), 'new_size': shared_file_size})
                                 # 继续往下走，加入 transfer_list
                     
                     # 检查是否在指定的文件列表中（使用原始路径检查）
@@ -1505,15 +1578,20 @@ class BaiduStorage:
                 if not transfer_list and not rename_only_success:
                     if progress_callback:
                         progress_callback('info', '没有找到需要处理的文件')
-                    return {'success': True, 'skipped': True, 'message': '没有新文件需要转存'}
-                
+                    result = {'success': True, 'skipped': True, 'message': '没有新文件需要转存'}
+                    self._save_transfer_history(task_config or {}, result, skipped_files=skipped_files)
+                    return result
+
                 if not transfer_list and rename_only_success:
                     # 只有重命名操作，没有转存
-                    return {
+                    result = {
                         'success': True,
                         'message': f'仅重命名操作完成，共处理 {len(rename_only_success)} 个文件',
                         'transferred_files': rename_only_success
                     }
+                    self._save_transfer_history(task_config or {}, result,
+                        transferred_files=rename_only_success, skipped_files=skipped_files)
+                    return result
                 
                 if progress_callback:
                     progress_callback('info', f'找到 {len(transfer_list)} 个新文件需要转存')
@@ -1773,13 +1851,13 @@ class BaiduStorage:
                 logger.info(f"=== 转存操作完成，结果汇总 ===")
                 logger.info(f"总文件数: {total_files}")
                 logger.info(f"成功转存: {success_count}")
-                
-                # 根据转存结果返回不同状态
+
+                # 构建结果并保存历史记录
                 if success_count == total_files:  # 全部成功
                     logger.success(f"转存全部成功，共 {success_count}/{total_files} 个文件")
                     if progress_callback:
                         progress_callback('success', f'转存完成，成功转存 {success_count}/{total_files} 个文件')
-                    return {
+                    result = {
                         'success': True,
                         'message': f'成功转存 {success_count}/{total_files} 个文件',
                         'transferred_files': transferred_files
@@ -1788,7 +1866,7 @@ class BaiduStorage:
                     logger.warning(f"转存部分成功，共 {success_count}/{total_files} 个文件")
                     if progress_callback:
                         progress_callback('warning', f'部分转存成功，成功转存 {success_count}/{total_files} 个文件')
-                    return {
+                    result = {
                         'success': True,
                         'message': f'部分转存成功，成功转存 {success_count}/{total_files} 个文件',
                         'transferred_files': transferred_files[:success_count]
@@ -1796,10 +1874,44 @@ class BaiduStorage:
                 else:  # 全部失败
                     if progress_callback:
                         progress_callback('error', '转存失败，没有文件成功转存')
-                    return {
+                    result = {
                         'success': False,
                         'error': '转存失败，没有文件成功转存'
                     }
+
+                # 如果配置了本地下载目录，将新转存的文件下载到本地
+                download_dir = (task_config or {}).get('download_dir', '').strip()
+                if download_dir and result.get('success') and result.get('transferred_files'):
+                    logger.info(f"=== 开始下载到本地: {download_dir} ===")
+                    if progress_callback:
+                        progress_callback('info', f'开始下载 {len(result["transferred_files"])} 个文件到本地')
+                    # 构建远程文件完整路径（save_dir + 相对路径）
+                    save_dir = task_config.get('save_dir', '')
+                    remote_paths = []
+                    for f in result['transferred_files']:
+                        remote_paths.append(posixpath.join(save_dir, f).replace('\\', '/'))
+                    dl_result = self.download_files_to_local(
+                        remote_paths, download_dir,
+                        client=temp_client,
+                        progress_callback=progress_callback,
+                        force=True   # 转存成功的文件都是最新的，直接覆盖
+                    )
+                    logger.info(f"下载完成: 成功 {dl_result['success']}, 跳过 {dl_result['skipped']}, 失败 {dl_result['failed']}")
+                    if progress_callback:
+                        progress_callback('info',
+                            f'本地下载: 成功 {dl_result["success"]} / 跳过 {dl_result["skipped"]} / 失败 {dl_result["failed"]}')
+                    result['download_result'] = dl_result
+
+                # 保存转存历史记录（含下载结果）
+                self._save_transfer_history(
+                    task_config or {},
+                    result,
+                    transferred_files=result.get('transferred_files', []),
+                    skipped_files=skipped_files,
+                    updated_files=updated_files
+                )
+
+                return result
                 
             except Exception as e:
                 error_msg = str(e)
@@ -2564,7 +2676,15 @@ class BaiduStorage:
                     tasks[task_index]['size_check'] = True
                 else:
                     tasks[task_index].pop('size_check', None)
-            
+
+            # 处理本地下载目录
+            if 'download_dir' in task_data:
+                val = (task_data.get('download_dir') or '').strip()
+                if val:
+                    tasks[task_index]['download_dir'] = val
+                else:
+                    tasks[task_index].pop('download_dir', None)
+
             # 保存配置并更新调度器
             self._save_config()
             
@@ -2580,6 +2700,182 @@ class BaiduStorage:
         except Exception as e:
             logger.error(f"更新任务失败: {str(e)}")
             return False
+
+    def download_files_to_local(self, remote_paths, local_base_dir, client=None, progress_callback=None,
+                                 force=False, max_retries=2):
+        """将网盘文件下载到本地目录（支持大文件自动回退到 PCS cookies 直连）
+        Args:
+            remote_paths: 待下载的远程文件路径列表（相对于网盘根目录）
+            local_base_dir: 本地基础目录（容器内路径）
+            client: 百度客户端实例
+            progress_callback: 进度回调
+            force: 强制重新下载（即使本地已存在）
+            max_retries: 每个文件失败后的最大重试次数（默认 2，即最多尝试 3 次）
+        Returns:
+            dict: {'success': int, 'failed': int, 'skipped': int, 'failed_details': list, 'errors': list}
+        """
+        import requests as req_lib
+        from urllib.parse import quote
+
+        if client is None:
+            client = self.client
+
+        raw_client = getattr(client, '_baidupcs', None)
+        if raw_client is None:
+            logger.error("无法获取底层客户端，下载功能不可用")
+            return {'success': 0, 'failed': len(remote_paths), 'skipped': 0,
+                    'failed_details': [], 'errors': ['客户端不可用']}
+
+        # 提取 cookies 字典，用于 PCS 直连回退
+        pcs_cookies = getattr(raw_client, '_cookies', {}) or {}
+        if not pcs_cookies:
+            # 尝试从 session 提取
+            sess = getattr(raw_client, '_session', None)
+            if sess and hasattr(sess, 'cookies'):
+                pcs_cookies = dict(sess.cookies)
+
+        os.makedirs(local_base_dir, exist_ok=True)
+        success_count = 0
+        failed_count = 0
+        skipped_count = 0
+        errors = []
+        failed_details = []
+
+        for i, remote_path in enumerate(remote_paths):
+            local_path = os.path.join(local_base_dir, remote_path.lstrip('/'))
+            local_dir = os.path.dirname(local_path)
+
+            if os.path.exists(local_path) and not force:
+                local_size = os.path.getsize(local_path)
+                logger.debug(f"本地文件已存在 ({local_size} 字节)，跳过下载: {local_path}")
+                skipped_count += 1
+                continue
+
+            os.makedirs(local_dir, exist_ok=True)
+
+            # 带重试的下载（两层策略：签名链接 → PCS cookies 直连）
+            last_error = None
+            download_ok = False
+            for attempt in range(max_retries + 1):
+                for strategy in ('signed', 'pcs_cookies'):
+                    try:
+                        if attempt > 0:
+                            delay = 2 + attempt * 3
+                            logger.info(f"重试下载 [{strategy}] ({attempt}/{max_retries}): {os.path.basename(remote_path)}")
+                            if progress_callback:
+                                progress_callback('info', f'重试下载 ({attempt}/{max_retries}): {os.path.basename(remote_path)}')
+                            time.sleep(delay)
+
+                        if progress_callback:
+                            progress_callback('info',
+                                f'下载中 ({i+1}/{len(remote_paths)}){chr(10)+"策略: "+strategy if attempt>0 else ""}: {os.path.basename(remote_path)}')
+
+                        if strategy == 'signed':
+                            url = raw_client.download_link(remote_path)
+                            if not url:
+                                raise RuntimeError("获取签名链接失败")
+                            resp = req_lib.get(url, stream=True, timeout=300,
+                                headers={'User-Agent': 'pan.baidu.com'})
+                        else:
+                            # PCS cookies 直连（大文件回退方案）
+                            url = f'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=download&app_id=250528&path={quote(remote_path)}'
+                            resp = req_lib.get(url, cookies=pcs_cookies, stream=True, timeout=900,
+                                headers={'User-Agent': 'netdisk', 'Connection': 'keep-alive'})
+
+                        resp.raise_for_status()
+
+                        # 流式写入，大文件用大 buffer
+                        buf_size = 131072  # 128KB
+                        with open(local_path, 'wb') as f:
+                            for chunk in resp.iter_content(chunk_size=buf_size):
+                                f.write(chunk)
+
+                        actual_size = os.path.getsize(local_path)
+                        if actual_size == 0:
+                            raise RuntimeError("下载的文件为空")
+
+                        success_count += 1
+                        logger.info(f"下载成功 [{strategy}]: {remote_path} -> {local_path} ({actual_size} 字节)")
+                        download_ok = True
+                        break  # 跳出 strategy 循环
+                    except Exception as e:
+                        last_error = e
+                        if os.path.exists(local_path):
+                            try:
+                                os.remove(local_path)
+                            except Exception:
+                                pass
+                        if strategy == 'pcs_cookies':
+                            # 两种策略都试过了，等下次 retry
+                            pass
+
+                if download_ok:
+                    break  # 跳出 attempt 循环
+
+            if not download_ok:
+                failed_count += 1
+                err_msg = f"下载失败 {remote_path}: {str(last_error)}"
+                logger.error(err_msg)
+                errors.append(err_msg)
+                failed_details.append({
+                    'remote_path': remote_path,
+                    'local_path': local_path,
+                    'error': str(last_error)
+                })
+
+            if i < len(remote_paths) - 1:
+                time.sleep(0.5)
+
+        return {
+            'success': success_count,
+            'failed': failed_count,
+            'skipped': skipped_count,
+            'failed_details': failed_details,
+            'errors': errors
+        }
+
+    def redownload_failed_files(self, task_config, client=None, progress_callback=None):
+        """根据任务配置重新下载上次失败的文件
+        Args:
+            task_config: 任务配置字典
+            client: 百度客户端实例
+            progress_callback: 进度回调
+        Returns:
+            dict: 下载结果
+        """
+        download_dir = (task_config or {}).get('download_dir', '').strip()
+        if not download_dir:
+            return {'success': 0, 'failed': 0, 'skipped': 0,
+                    'errors': ['任务未配置下载目录'], 'failed_details': []}
+
+        save_dir = task_config.get('save_dir', '')
+        # 获取上次记录中失败的文件
+        history = self.get_transfer_history(limit=5)
+        failed_paths = []
+        for record in history:
+            if record.get('task_url') == task_config.get('url'):
+                dl_result = record.get('download_result', {})
+                if dl_result and dl_result.get('failed_details'):
+                    for detail in dl_result['failed_details']:
+                        failed_paths.append(detail['remote_path'])
+                break
+
+        if not failed_paths:
+            logger.info("没有需要重新下载的文件")
+            return {'success': 0, 'failed': 0, 'skipped': 0,
+                    'errors': [], 'failed_details': []}
+
+        logger.info(f"重新下载 {len(failed_paths)} 个失败文件")
+        if progress_callback:
+            progress_callback('info', f'重新下载 {len(failed_paths)} 个失败文件')
+
+        return self.download_files_to_local(
+            failed_paths, download_dir,
+            client=client,
+            progress_callback=progress_callback,
+            force=True,         # 强制覆盖已有的不完整文件
+            max_retries=2       # 再次重试 2 次
+        )
 
     def ensure_dir_exists(self, remote_dir):
         """确保远程目录存在，如果不存在则创建"""

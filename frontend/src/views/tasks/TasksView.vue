@@ -55,6 +55,10 @@
       </div>
       
       <div class="toolbar-right">
+        <el-button @click="showHistory" style="margin-right: 8px">
+          <el-icon><Clock /></el-icon>
+          转存历史
+        </el-button>
         <el-button-group v-if="selectedTasks.length > 0">
           <el-button @click="executeBatchTasks">
             <el-icon><VideoPlay /></el-icon>
@@ -370,15 +374,86 @@
         <el-button type="primary" @click="saveColumnSettings">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 转存历史对话框 -->
+    <el-dialog v-model="historyVisible" title="转存历史记录" width="900px" :close-on-click-modal="false">
+      <div v-if="historyLoading" style="text-align: center; padding: 40px">
+        <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+        <p>加载中...</p>
+      </div>
+      <div v-else-if="historyRecords.length === 0" style="text-align: center; padding: 40px; color: #999">
+        暂无转存记录
+      </div>
+      <el-table v-else :data="historyRecords" stripe max-height="500" size="small">
+        <el-table-column prop="time" label="时间" width="160" />
+        <el-table-column prop="task_name" label="任务" min-width="120" show-overflow-tooltip />
+        <el-table-column label="操作" width="200">
+          <template #default="{ row }">
+            <el-tag v-if="row.success && !row.skipped" type="success" size="small">转存成功</el-tag>
+            <el-tag v-else-if="row.skipped" type="info" size="small">无新文件</el-tag>
+            <el-tag v-else type="danger" size="small">转存失败</el-tag>
+            <span style="margin-left: 8px; font-size: 12px; color: #666">{{ row.message }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="文件统计" width="240">
+          <template #default="{ row }">
+            <span v-if="row.new_count > 0" style="color: #67C23A; margin-right: 8px">新增 {{ row.new_count }}</span>
+            <span v-if="row.updated_count > 0" style="color: #E6A23C; margin-right: 8px">更新 {{ row.updated_count }}</span>
+            <span v-if="row.skipped_count > 0" style="color: #909399">跳过 {{ row.skipped_count }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="本地下载" width="130">
+          <template #default="{ row }">
+            <template v-if="row.download_result">
+              <span style="font-size: 12px">
+                <span style="color: #67C23A">✓{{ row.download_result.success }}</span>
+                <span v-if="row.download_result.failed > 0" style="color: #F56C6C; margin-left: 4px">✗{{ row.download_result.failed }}</span>
+                <span v-if="row.download_result.skipped > 0" style="color: #909399; margin-left: 4px">-{{ row.download_result.skipped }}</span>
+              </span>
+            </template>
+            <span v-else style="color: #C0C4CC; font-size: 12px">未配置</span>
+          </template>
+        </el-table-column>
+        <el-table-column type="expand" width="60">
+          <template #default="{ row }">
+            <div style="padding: 8px 16px">
+              <div v-if="row.files && row.files.length > 0">
+                <div v-for="(f, i) in row.files" :key="i" style="padding: 2px 0; font-size: 12px">
+                  <el-tag v-if="f.action === 'new'" type="success" size="small" effect="plain">新增</el-tag>
+                  <el-tag v-else-if="f.action === 'updated'" type="warning" size="small" effect="plain">更新</el-tag>
+                  <el-tag v-else type="info" size="small" effect="plain">跳过</el-tag>
+                  <span style="margin-left: 6px">{{ f.path }}</span>
+                  <span v-if="f.action === 'updated' && f.old_size" style="margin-left: 8px; color: #999; font-size: 11px">
+                    {{ formatFileSize(f.old_size) }} → {{ formatFileSize(f.new_size) }}
+                  </span>
+                </div>
+              </div>
+              <div v-else style="color: #999">无详细文件记录</div>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button
+          v-if="selectedHistoryTask"
+          type="warning"
+          :loading="redownloading"
+          @click="retryDownload"
+        >
+          重新下载失败文件
+        </el-button>
+        <el-button @click="historyVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus'
-import { 
-  Plus, Search, VideoPlay, Delete, Edit, Share, 
-  Link, CopyDocument, DCaret, Sort, Setting
+import {
+  Plus, Search, VideoPlay, Delete, Edit, Share,
+  Link, CopyDocument, DCaret, Sort, Setting, Clock, Loading
 } from '@element-plus/icons-vue'
 import { storeToRefs } from 'pinia'
 import { useTaskStore } from '@/stores/tasks'
@@ -387,6 +462,7 @@ import AddTaskDialog from '@/components/business/AddTaskDialog.vue'
 import TaskRunnerDialog from '@/components/business/TaskRunnerDialog.vue'
 import type { Task } from '@/types'
 import { getTaskStatusText } from '@/utils/helpers'
+import { apiService } from '@/services'
 import Sortable from 'sortablejs'
 
 const taskStore = useTaskStore()
@@ -437,6 +513,62 @@ const editingTask = ref<Task | null>(null)
 const showTaskRunner = ref(false)
 const runningTask = ref<Task | null>(null)
 const runningTaskId = ref(-1)
+
+// 转存历史
+const historyVisible = ref(false)
+const historyLoading = ref(false)
+const historyRecords = ref<any[]>([])
+const redownloading = ref(false)
+
+const selectedHistoryTask = computed(() => {
+  for (const r of historyRecords.value) {
+    const dl = r.download_result
+    if (dl && dl.failed > 0) return { url: r.task_url, name: r.task_name }
+  }
+  return null
+})
+
+async function showHistory() {
+  historyVisible.value = true
+  historyLoading.value = true
+  try {
+    const response = await apiService.getTransferHistory(50)
+    if (response.success) {
+      historyRecords.value = response.records || []
+    }
+  } catch (e) {
+    ElMessage.error('获取转存历史失败')
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+async function retryDownload() {
+  if (!selectedHistoryTask.value) return
+  redownloading.value = true
+  try {
+    const response = await apiService.redownloadFailedFiles(selectedHistoryTask.value.url)
+    if (response.success) {
+      ElMessage.success(response.message || '重新下载完成')
+      await showHistory() // 刷新
+    } else {
+      ElMessage.error(response.message || '重新下载失败')
+    }
+  } catch (e) {
+    ElMessage.error('重新下载失败')
+  } finally {
+    redownloading.value = false
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  if (!bytes || bytes <= 0) return '? B'
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB'
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB'
+  return (bytes / 1073741824).toFixed(2) + ' GB'
+}
+
 
 // 拖拽状态
 const isDragging = ref(false)
